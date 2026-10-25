@@ -265,3 +265,6 @@ go build ./...
 ```
 
 **Import path errors after moving files** — imports are absolute from the module root, so they always start with `github.com/andrew22krohmalyuk/scout-be/`.
+
+
+## docker compose up --build

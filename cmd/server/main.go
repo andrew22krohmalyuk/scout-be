@@ -10,7 +10,6 @@ import (
 	"github.com/andrew22krohmalyuk/scout-be/internal/db"
 	// "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
 )
 
 const (
@@ -44,15 +43,18 @@ func main() {
 	log.Println("Main start ...")
 
 	db.Connect()
-	// godotenv resolves .env relative to the working directory, so the server
-	// has to start from the repo root — which is what `make run` does. A
-	// missing file is not fatal: deployed environments inject the same keys
-	// directly and never ship a .env.
-	if err := godotenv.Load(); err != nil {
-		log.Printf("no .env loaded (%v); falling back to the ambient environment", err)
+
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	if clientID == "" {
+		log.Fatal("GOOGLE_CLIENT_ID is unset")
 	}
-	googleOIDC.clientID = os.Getenv("GOOGLE_CLIENT_ID")
-	googleOIDC.clientSecret = os.Getenv("GOOGLE_CLIENT_SECRET")
+	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	if clientSecret == "" {
+		log.Fatal("GOOGLE_CLIENT_SECRET is unset")
+	}
+
+	googleOIDC.clientID = clientID
+	googleOIDC.clientSecret = clientSecret
 
 	gin.SetMode(gin.DebugMode)
 	r := gin.Default()
