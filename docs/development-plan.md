@@ -11,7 +11,7 @@ Scout helps job seekers apply to jobs across three apps:
 |---|---|---|
 | Chrome extension (MV3) | `scout-ext` | **Does not exist** |
 | Backend (Go + Postgres) | `scout-be` | One 25-line stdlib health handler, zero dependencies |
-| Dashboard (React) | `scout-fe` | Stock CRA scaffold, JS not TS, nothing built |
+| Dashboard (React) | `scout-fe` | React Router v8 SPA (`ssr: false`) + TS. Client half of auth built, waiting on the API |
 
 This is greenfield. Nothing to refactor; the cost is all in decisions, and this plan makes them.
 
@@ -19,9 +19,9 @@ This is greenfield. Nothing to refactor; the cost is all in decisions, and this 
 
 ### Locked decisions
 
-- **Stack:** chi + pgx/v5 + sqlc + goose, Postgres
-- **Auth:** Google OAuth only in v1 — extension via `chrome.identity.launchWebAuthFlow`, web via redirect. Backend verifies the Google ID token and issues its own access JWT + rotating refresh token. Provider abstraction (`identities` table) so email/password can be added later without touching session handling.
-- **Contract:** OpenAPI-first. `openapi.yaml` is truth → `oapi-codegen` (Go) + `openapi-typescript` (TS clients).
+- **Stack:** gin-gonic + pgx/v5 + sqlc + goose, Postgres
+- **Auth:** Google OIDC only in v1, **Authorization Code Flow + PKCE with the backend as a confidential client**. Neither client ever receives a Google token; the code is exchanged server-side. Web is a full-redirect BFF terminating in an opaque session cookie. The extension uses `chrome.identity.launchWebAuthFlow` to obtain a code and posts it to the backend, which exchanges it and returns a bearer access JWT + rotating refresh token. Provider abstraction (`identities` table) so email/password can be added later without touching session handling.
+- **Contract:** OpenAPI-first. `openapi.yaml` is truth → `oapi-codegen` (Go, `gin-server` generator) + `openapi-typescript` (TS clients).
 - **Repos:** three separate. Generated TS client published as a private npm package.
 - **PII:** transport + at-rest only. No app-level envelope encryption. *(One carve-out proposed — see Risk 4.)*
 - **LLM:** not in v1. Schema and service seams built for it; deterministic rules-based scoring ships first.
@@ -41,10 +41,10 @@ scout-be/
 │   ├── config/                   # env → struct, validated at boot, exit(1) on missing
 │   ├── telemetry/                # slog JSON handler + OTel setup
 │   ├── httpapi/
-│   │   ├── gen/                  # oapi-codegen output — COMMITTED
-│   │   ├── middleware/
-│   │   └── *.go                  # handlers, thin: decode → service → encode
-│   ├── auth/                     # OIDC verify, JWT issue/verify, refresh rotation
+│   │   ├── gen/                  # oapi-codegen gin-server output — COMMITTED
+│   │   ├── middleware/           # gin.HandlerFunc chain
+│   │   └── *.go                  # ServerInterface impl, thin: bind → service → encode
+│   ├── auth/                     # OIDC code exchange; web sessions; JWT + refresh rotation (ext)
 │   ├── store/
 │   │   ├── gen/                  # sqlc output — COMMITTED
 │   │   ├── queries/*.sql         # hand-written SQL
@@ -98,12 +98,31 @@ identities(id uuid PK, user_id uuid FK→users ON DELETE CASCADE,
 
 Key on `sub`, **never on email** — Google account emails change, `sub` doesn't. Keying on email is an account-takeover vector.
 
+Both clients run the same Authorization Code flow against the same `identities` rows. They differ only in what the backend hands back at the end, so there are two session tables.
+
+**Web — opaque server-side session.** No JWT: a JWT cannot be revoked before it expires, which makes sign-out and "log out everywhere" impossible to honour. A row lookup per request is cheap at this scale.
+
+```sql
+sessions(id uuid PK,
+         token_hash bytea NOT NULL UNIQUE,  -- SHA-256 of 32 random bytes; never store plaintext
+         user_id uuid FK→users ON DELETE CASCADE NOT NULL,
+         expires_at timestamptz NOT NULL,   -- absolute cap, 30d
+         last_seen_at timestamptz NOT NULL, -- sliding idle window, 7d
+         revoked_at timestamptz,
+         user_agent text, ip inet, created_at)
+  INDEX(user_id) WHERE revoked_at IS NULL
+```
+
+The transient OIDC state — `state`, `nonce`, PKCE verifier and `return_to` — lives in a short-lived (~10 min) `HttpOnly` cookie written at `/auth/login` and consumed at `/auth/callback`. No table needed; it is single-use and self-expiring.
+
+**Extension — bearer access JWT + rotating refresh token.** MV3 makes cookies from a `chrome-extension://` origin awkward, so the extension gets tokens instead.
+
 ```sql
 refresh_tokens(id uuid PK, user_id uuid FK CASCADE,
                token_hash bytea NOT NULL UNIQUE,  -- SHA-256; never store plaintext
                family_id uuid NOT NULL,
                parent_id uuid,
-               client text NOT NULL,              -- 'extension' | 'web'
+               client text NOT NULL,              -- 'extension' (web uses `sessions`)
                expires_at timestamptz NOT NULL,
                used_at timestamptz, revoked_at timestamptz,
                user_agent text, ip inet, created_at)
@@ -272,7 +291,11 @@ Deferred to Phase 7: `prompt_versions(name, version, template, model, params)` a
 
 `E` = extension, `D` = dashboard.
 
-**Auth** — `POST /auth/google` (ID token → token pair) `E D` · `POST /auth/refresh` `E D` · `POST /auth/logout` (revoke family) `E D` · `GET /me` `E D`
+**Auth — web (BFF)** `D` — `GET /auth/login?return_to=` (mint state + nonce + PKCE verifier, 302 → Google) · `GET /auth/callback` (verify state, exchange code, verify nonce, upsert identity, set session cookie, 302 → dashboard) · `GET /auth/me` · `POST /auth/logout` (revoke session)
+
+**Auth — extension** `E` — `POST /auth/exchange` (code + PKCE verifier → token pair) · `POST /auth/refresh` (rotate) · `POST /auth/logout` (revoke family) · `GET /auth/me`
+
+`GET /auth/me` is one handler serving both — the auth middleware has already resolved `user_id` from whichever credential the client presented. `return_to` **must** be validated against a same-origin absolute path before the callback redirects to it, or the endpoint is an open redirect on an auth path. `scout-fe`'s `safeRedirectPath` is the mirror of this check; the browser-side one guards nothing on its own.
 
 **Ingest** — `POST /ingest/events` (batch, idempotent, per-event accept/duplicate result) `E` · `POST /jobs/resolve` (scraped posting → canonical job + existing application state + match score; the extension's "does this page matter" call) `E`
 
@@ -296,9 +319,33 @@ Blobs never proxy through Go. Presigned URLs only.
 
 ## D. Cross-cutting
 
-**Middleware order** (outer → inner): RequestID → RealIP → CORS → OTel → Logger → Recoverer → Timeout → RateLimit → MaxBytesReader → Auth → route.
+**Middleware order** (outer → inner): RequestID → ClientIP → CORS → OTel → Logger → Recovery → Timeout → RateLimit → MaxBytesReader → Auth → route.
 
 CORS sits near the outside so preflight `OPTIONS` short-circuits before auth and rate limiting.
+
+| Concern | Implementation |
+|---|---|
+| RequestID | `gin-contrib/requestid` |
+| ClientIP | not middleware — `engine.SetTrustedProxies(...)` + `c.ClientIP()` |
+| CORS | `gin-contrib/cors`, exact-match allowlist from config |
+| OTel | `otelgin` (`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`) |
+| Logger | custom — `log/slog` JSON, request-scoped logger into `c.Set` |
+| Recovery | custom — wraps `gin.Recovery` behaviour but emits `problem+json` |
+| Timeout | `gin-contrib/timeout` |
+| RateLimit | custom token bucket, in-memory to start |
+| MaxBytesReader | custom — `c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, n)` |
+| Auth | custom — session cookie (web) *or* bearer JWT (extension) → `user_id` in `c.Set` |
+
+### gin specifics that bite
+
+These are all consequences of gin using its own `*gin.Context` instead of the stdlib handler signature. None are blockers; all are silent-wrong-behaviour if missed.
+
+- **`gin.New()`, never `gin.Default()`.** `Default()` installs gin's text-format Logger and a Recovery that writes plain text — both contradict the slog-JSON and RFC 9457 decisions below. Build the chain explicitly. Set `gin.SetMode(gin.ReleaseMode)` outside dev.
+- **`SetTrustedProxies` is load-bearing for rate limiting.** Fly.io terminates TLS at its proxy, so without trusting it `c.ClientIP()` returns the proxy's address — and per-IP limits on the unauthenticated auth routes silently become one global bucket shared by every client. Trust Fly's proxy range explicitly; never `SetTrustedProxies(nil)` in production.
+- **Override `NoRoute` and `NoMethod`.** Gin's defaults return plain-text 404/405, which breaks the one-error-shape contract both clients parse. `HandleMethodNotAllowed = true` must also be set explicitly or a wrong method returns 404 instead of 405.
+- **Stdlib middleware needs `gin.WrapH` / `gin.WrapF`.** Anything written against `http.Handler` — including some OTel and OpenAPI validation helpers — does not compose directly.
+- **Validation consolidates.** Gin's binding layer *is* `go-playground/validator/v10`, so `binding:"required,email"` tags on the generated request structs replace a separate validate step. One library, not two. Bind errors must still be translated into the `problem+json` `errors[]` array rather than returned raw.
+- **OpenAPI request validation:** `github.com/oapi-codegen/gin-middleware` (`OapiRequestValidator`), mounted in dev/test only.
 
 ### CORS for a Chrome extension — the part that's genuinely unusual
 
@@ -307,14 +354,19 @@ CORS sits near the outside so preflight `OPTIONS` short-circuits before auth and
 - **All backend calls must originate from the extension's service worker, not content scripts.** A content script's `fetch` carries the *page's* origin (`linkedin.com`), which you must never allowlist. Content script → `chrome.runtime.sendMessage` → service worker → API. This is a hard architectural constraint on the extension, not a preference.
 - Add the API domain to `host_permissions` in the manifest.
 
-### Token placement differs per client — and the backend must serve both
+### Credential placement differs per client — and the backend must serve both
 
-| | Access token | Refresh token |
+| | What the client holds | Where |
 |---|---|---|
-| Extension | `chrome.storage.session` (memory-only, cleared on browser close) | `chrome.storage.local` |
-| Dashboard | in-memory JS variable — **not** localStorage | `HttpOnly; Secure; SameSite=Lax` cookie scoped to `/api/v1/auth/refresh` |
+| Dashboard | **Nothing.** No token ever reaches JavaScript. | `HttpOnly; Secure; SameSite=Lax; Domain=.scout.dev` session cookie |
+| Extension | Access JWT | `chrome.storage.session` (memory-only, cleared on browser close) |
+| Extension | Refresh token | `chrome.storage.local` |
 
-Extension uses bearer headers, so no cookies and no CSRF surface. The dashboard's refresh cookie is `SameSite=Lax` on a POST endpoint, which covers most of CSRF; add a double-submit token for depth. `/auth/refresh` reads the token from cookie *or* body depending on the client type.
+The dashboard is the strong case: because the session is an opaque ID in an `HttpOnly` cookie, XSS on the dashboard cannot exfiltrate a durable credential. It buys this at the cost of a `GET /auth/me` round trip per page load, memoised client-side.
+
+`SameSite=Lax` blocks cross-site POSTs, which covers most of CSRF for the dashboard; add a double-submit token for depth on mutating routes. The extension uses bearer headers, so it has no cookie and no CSRF surface at all.
+
+**Deployment topology is load-bearing here.** The dashboard and API must sit on subdomains of one registrable domain (`app.scout.dev` / `api.scout.dev`) so the session cookie is first-party under `SameSite=Lax`. Splitting them across unrelated domains forces `SameSite=None`, which browsers are actively restricting.
 
 ### Everything else
 
@@ -322,7 +374,7 @@ Extension uses bearer headers, so no cookies and no CSRF surface. The dashboard'
 - **Pagination:** keyset/cursor, base64 `(sort_key, id)`. Offset pagination duplicates and skips rows under concurrent inserts — exactly what an event-ingesting app does constantly.
 - **Idempotency:** client-minted UUIDv7 per event + `INSERT … ON CONFLICT (id) DO NOTHING`. Response reports per-event status so the extension can clear its outbox precisely. `Idempotency-Key` header on other mutating endpoints.
 - **Rate limiting:** per-IP on unauthenticated routes, per-user on authenticated. Token bucket, in-memory to start, Redis when you outgrow one instance. Return `429` + `Retry-After` + `RateLimit-*`; extension honors it with exponential backoff and jitter.
-- **Validation:** `go-playground/validator` on decoded structs, plus OpenAPI request validation middleware in dev/test.
+- **Validation:** gin's binding layer (`go-playground/validator/v10` under the hood) via `binding:"..."` tags, plus `oapi-codegen/gin-middleware` request validation in dev/test.
 - **Config:** env → struct, validated at boot, non-zero exit on anything missing. No `.env` in production — Fly secrets.
 - **Logging:** `log/slog` JSON, request-scoped logger carrying `request_id` and `trace_id`. **Because PII is unencrypted at rest, logs are the primary leak vector** — implement `slog.LogValuer` on every PII-bearing struct to force redaction, and add a CI grep for raw `%+v` on those types.
 - **Server timeouts:** `ReadHeaderTimeout` (Slowloris — `gosec` flags its absence), `ReadTimeout`, `WriteTimeout`, `IdleTimeout`. Graceful shutdown on SIGINT/SIGTERM with a ~15s drain, then close pool and flush OTel.
@@ -345,9 +397,9 @@ Two details that matter: `date_trunc` + `generate_series` to fill gap weeks (oth
 
 - **Unit** — pure logic only: match scoring, keyword extraction, title/company normalization, stage transition rules, JWT claims. No I/O.
 - **Integration** — anything touching Postgres, via `testcontainers-go` with a real PG and real goose migrations. **Do not mock the database.** The entire value of sqlc is that the SQL is real; mocking it tests a fiction.
-- **Handlers** — `httptest` against the real router and real DB, with an injectable token issuer for auth. Table-driven.
+- **Handlers** — `httptest` against the real gin engine (`gin.SetMode(gin.TestMode)`) and real DB, with an injectable credential issuer so a test can mint either a session cookie or a bearer JWT. Table-driven, and every authenticated route exercised both ways — a route that only works for one client type is the failure mode dual-path auth invites. Build the engine through the same constructor production uses, so middleware-order regressions surface in tests.
 - **Contract** — validate examples against `openapi.yaml` in CI via `kin-openapi`; plus the codegen-drift check (`make generate && git diff --exit-code`).
-- **Fakes** — local JWKS server for Google OIDC, minio for S3, and later the LLM provider. Real Postgres, fake everything external.
+- **Fakes** — a local OIDC provider for Google: discovery document, authorization endpoint, **token endpoint** and JWKS. A JWKS server alone is not enough once the backend exchanges codes rather than verifying a client-supplied ID token. Plus minio for S3, and later the LLM provider. Real Postgres, fake everything external.
 - **Analytics** — golden-file assertions against a seeded fixture dataset, plus a generator that seeds 10k applications for benchmarking.
 
 ---
@@ -357,13 +409,13 @@ Two details that matter: `date_trunc` + `generate_series` to fill gap weeks (oth
 Each phase is a vertical slice that leaves the product working.
 
 ### Phase 0 — Foundation *(backend only)*
-Rewrite README. Makefile, multi-stage Dockerfile (distroless, non-root), docker-compose, `.golangci.yml` with `gosec`/`errcheck`/`sqlclosecheck`. `config` + `telemetry` packages. chi router with the full middleware stack. pgxpool. goose with embedded migrations. sqlc config. CI: lint, test, `govulncheck`, codegen-drift.
+Rewrite README. Makefile, multi-stage Dockerfile (distroless, non-root), docker-compose, `.golangci.yml` with `gosec`/`errcheck`/`sqlclosecheck`. `config` + `telemetry` packages. gin router with the full middleware stack, incl. `NoRoute`/`NoMethod` and trusted-proxy config. pgxpool. goose with embedded migrations. sqlc config. CI: lint, test, `govulncheck`, codegen-drift.
 **Exit:** `docker compose up` serves the API; `/healthz` + `/readyz` green; CI green; deployed to Fly with TLS on a real domain.
 
 ### Phase 1 — Identity
-`users` / `identities` / `refresh_tokens`. go-oidc verification, JWT issue/verify, rotation with reuse detection, auth middleware, CORS allowlist with pinned extension ID, auth rate limits. **Establish the OpenAPI → codegen pipeline here** — this phase exists partly to prove that workflow before the surface grows.
-Frontend work lands here too: **migrate `scout-fe` from CRA to Vite + TypeScript** (see Risk 5) and scaffold `scout-ext` (MV3 + Vite + React).
-**Exit:** Google sign-in works from both dashboard and a stub extension; refresh rotates; reusing a rotated token revokes the family; `/me` returns from both origins.
+`users` / `identities` / `sessions` / `refresh_tokens`. go-oidc discovery + code exchange (`golang.org/x/oauth2/google`), `state` / `nonce` / PKCE handling, opaque session issue + lookup, JWT issue/verify, rotation with reuse detection, dual-path auth middleware, `return_to` validation, CORS allowlist with pinned extension ID, auth rate limits. **Establish the OpenAPI → codegen pipeline here** — this phase exists partly to prove that workflow before the surface grows.
+Frontend work lands here too: scaffold `scout-ext` (MV3 + Vite + React). `scout-fe`'s client half is already built against these endpoints — it needs no change if the contract holds.
+**Exit:** Google sign-in works from both dashboard and a stub extension; a tampered `state` and a replayed `nonce` are both rejected; refresh rotates; reusing a rotated token revokes the family; `GET /auth/me` returns from both origins; sign-out invalidates the session server-side.
 
 ### Phase 2 — Passive tracking *(capability 1)* ← the slice that makes it a product
 `companies` / `jobs` / `job_sightings` / `applications` / `application_events` / `application_stages` / `ingest_events`. Batch idempotent `POST /ingest/events`, `POST /jobs/resolve`, projection worker on SKIP LOCKED, dedup + normalization.
@@ -401,7 +453,7 @@ Postgres RLS as defense-in-depth. Automated backups **with a tested restore** �
 2. **Chrome Web Store review.** Broad `host_permissions` (`*://*/*`) triggers manual review and rejection. Use narrow per-ATS match patterns plus `optional_host_permissions` requested at runtime. MV3 bans remotely-hosted code — no `eval`, no CDN scripts, everything bundled. A privacy policy and data-use disclosures are mandatory since you handle PII. Budget weeks, not days, for first approval.
 3. **MV3 service worker lifecycle.** The worker is terminated after ~30s idle. No in-memory queues, no `setTimeout` beyond that window, no assumption of continuity. Everything durable in `chrome.storage.local`, `chrome.alarms` (30s minimum period) for retry flush, full state rehydration on every wake. This is the single largest source of "events silently disappeared" bugs in MV3 extensions.
 4. **PII with at-rest-only encryption.** A defensible call — but the consequence is that a leaked DB dump or backup is a complete PII breach *including EEO/demographic data, which is special-category under GDPR Art. 9*. Compensating controls are non-optional: PII never in logs (enforced, not intended), encrypted and access-audited backups, EEO isolated in its own table. **One thing worth reconsidering:** `profile_eeo` is written once and never queried or filtered, so envelope-encrypting just that table costs nothing operationally and removes the worst-case disclosure. Small carve-out, disproportionate benefit.
-5. **`scout-fe` is on deprecated tooling.** `react-scripts@5.0.1` is unmaintained, carries known transitive advisories, and has no React 19 support story despite React 19 being in its `package.json`. Migrate to Vite + TS in Phase 1, before anything is built on top of it.
+5. ~~**`scout-fe` is on deprecated tooling.**~~ **Closed.** Migrated off CRA to React Router v8 framework mode (`ssr: false`) on Vite + TypeScript. The dashboard's auth client — session lookup, sign-in link, route gate, `return_to` safety — is built and green, and it is the reason the auth design above is a BFF: with no runtime Node server in `scout-fe`, the Go API is the only place OIDC can terminate.
 6. **Shared `jobs` table is a cross-tenant surface.** Canonical postings are global by design. The discipline that keeps this safe is absolute: user-derived free text lives in `job_sightings.raw_payload`, never promoted into `jobs`.
 7. **Scope vs. solo capacity.** Three apps and four extension capabilities is a lot. The phase ordering exists to keep something shippable at every point — resist working the four capabilities in parallel.
 
@@ -427,4 +479,4 @@ curl -fsS localhost:8080/readyz         # DB reachable
 
 **Analytics, Phase 3 onward:** seed 10k applications, run `EXPLAIN (ANALYZE, BUFFERS)` on every aggregate query, assert index-only scans on the funnel path and <200ms wall clock.
 
-**Auth, ongoing:** an integration test that rotates a refresh token, replays the consumed one, and asserts the whole family is revoked.
+**Auth, ongoing:** integration tests that (a) rotate a refresh token, replay the consumed one, and assert the whole family is revoked; (b) drive `/auth/login` → `/auth/callback` against a local fake OIDC provider and assert that a mismatched `state`, a mismatched `nonce`, and a replayed authorization code are each rejected; (c) assert `return_to=//evil.com` and `return_to=https://evil.com` both fall back to the default path.

@@ -1,19 +1,27 @@
-.PHONY: build run test lint clean
+.PHONY: build build-server build-worker run run-worker test lint clean dev
 
-BINARY := bin/scout
-CMD    := ./cmd/server
+build: build-server build-worker
 
-build:
-	go build -o $(BINARY) $(CMD)
+build-server:
+	go build -o bin/server ./cmd/server
 
-run: build
-	./$(BINARY)
+build-worker:
+	go build -o bin/worker ./cmd/worker
+
+run: build-server
+	./bin/server
+
+run-worker: build-worker
+	./bin/worker
 
 test:
 	go test ./... -race -cover
 
 lint:
 	go vet ./...
+
+dev: 
+	go tool air
 
 clean:
 	rm -rf bin/

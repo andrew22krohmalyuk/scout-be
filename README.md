@@ -154,10 +154,21 @@ golangci-lint run   # full linter suite (optional tool)
 
 ## Configuration
 
-Configuration comes from environment variables. There are no config files.
+Configuration comes from environment variables. Locally they are loaded from a
+gitignored `.env` in the repo root — copy the template and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+`.env` is read at startup relative to the working directory, so start the server
+from the repo root (`make run` does). Deployed environments inject the same keys
+directly and ship no `.env`; a missing file logs a warning and is not fatal.
 
 | Variable | Default | Description |
 |---|---|---|
+| `GOOGLE_CLIENT_ID` | *(empty)* | Google OIDC client ID. `/v1/auth/login` returns `500` without it. |
+| `GOOGLE_CLIENT_SECRET` | *(empty)* | Google OIDC client secret. Never commit this. |
 | `PORT` | `8080` | Port the server binds to. |
 | `HOST` | *(empty)* | Interface to bind to. Empty means all interfaces. Set to `127.0.0.1` to accept local connections only. |
 

@@ -1,0 +1,9 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/server ./cmd/server"
+  entrypoint = ["./tmp/server"]
+  include_ext = ["go"]
+  exclude_dir = ["bin", "tmp"]
+  delay = 500 # ms; groups rapid saves into one rebuild
